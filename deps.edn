@@ -1,0 +1,4 @@
+{:paths ["src"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.0"}
+        cljfx/cljfx	    {:mvn/version "1.7.24"}}
+ :main-opts ["-m" "clograph.core"]}
