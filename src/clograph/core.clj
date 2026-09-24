@@ -1,24 +1,32 @@
-
-;; This defines the cljfx UI, port hitboxes, wire curves, dragging, and execution triggers.
-
 (ns clograph.core
   (:require [cljfx.api :as fx]
             [clograph.compiler :as comp])
   (:gen-class))
 
-;; --- State & Defaults ---
+;; --- State & Initial Top-to-Bottom Layout ---
 
-(def node-width 130.0)
-(def node-height 70.0)
+(def node-width 140.0)
+(def node-height 75.0)
 
 (def initial-state
-  {:nodes [{:id :val-1 :type :val    :value 15 :x 40.0  :y 80.0  :outputs [:out]}
-           {:id :val-2 :type :val    :value 27 :x 40.0  :y 200.0 :outputs [:out]}
-           {:id :fn-1  :type :fn     :op '+    :x 240.0 :y 140.0 :inputs [:in-a :in-b] :outputs [:out]}
-           {:id :out-1 :type :output :result nil :x 440.0 :y 140.0 :inputs [:in]}]
-   :edges []
-   :connecting nil ;; {:from-node ... :from-port ...}
-   :drag-state nil})
+  {:nodes
+   [;; Top row: Input values
+    {:id :val-1 :type :val    :value 15  :x 160.0 :y 50.0  :outputs [:out]}
+    {:id :val-2 :type :val    :value 27  :x 380.0 :y 50.0  :outputs [:out]}
+    ;; Middle row: + Function
+    {:id :fn-1  :type :fn     :op '+     :x 270.0 :y 190.0 :inputs [:in-a :in-b] :outputs [:out]}
+    ;; Bottom row: Output Sink
+    {:id :out-1 :type :output :result nil :x 270.0 :y 340.0 :inputs [:in]}]
+
+   ;; Pre-wired edges: val-1 & val-2 -> fn-1 -> out-1
+   :edges
+   [{:from-node :val-1 :from-port :out :to-node :fn-1 :to-port :in-a}
+    {:from-node :val-2 :from-port :out :to-node :fn-1 :to-port :in-b}
+    {:from-node :fn-1  :from-port :out :to-node :out-1 :to-port :in}]
+
+   :connecting nil   ;; {:from-node ... :from-port ...}
+   :drag-state nil   ;; {:node-id ... :mouse-x ... :mouse-y ... :node-x ... :node-y ...}
+   :status "Ready. Click RUN GRAPH or drag nodes."})
 
 (defonce *state (atom initial-state))
 
@@ -36,7 +44,7 @@
           y (if (= kind :in) (:y node) (+ (:y node) node-height))]
       [x y])))
 
-;; --- UI Event Handlers ---
+;; --- Central Event Handler ---
 
 (defn handle-event [{:keys [event/type] :as event}]
   (case type
@@ -45,9 +53,12 @@
           id (keyword (str (name ntype) "-" (rand-int 1000)))
           new-node (case ntype
                      :val    {:id id :type :val :value 10 :x 100.0 :y 100.0 :outputs [:out]}
-                     :fn     {:id id :type :fn :op '+ :x 100.0 :y 100.0 :inputs [:in-a :in-b] :outputs [:out]}
+                     :fn     {:id id :type :fn  :op '+    :x 100.0 :y 100.0 :inputs [:in-a :in-b] :outputs [:out]}
                      :output {:id id :type :output :result nil :x 100.0 :y 100.0 :inputs [:in]})]
-      (swap! *state update :nodes conj new-node))
+      (swap! *state (fn [s]
+                      (-> s
+                          (update :nodes conj new-node)
+                          (assoc :status (str "Added " (name ntype) " node."))))))
 
     :update-val
     (let [val (or (try (Long/parseLong (:val event)) (catch Exception _ nil)) 0)]
@@ -56,65 +67,79 @@
                (mapv #(if (= (:id %) (:node-id event)) (assoc % :value val) %) nodes))))
 
     :click-output-port
-    (swap! *state assoc :connecting {:from-node (:node-id event)
-                                     :from-port (:port-id event)})
+    (swap! *state assoc
+           :connecting {:from-node (:node-id event) :from-port (:port-id event)}
+           :status (str "Wiring from " (name (:node-id event)) ". Click a green input port."))
 
     :click-input-port
-    (swap! *state (fn [{:keys [connecting edges] :as state}]
-                    (if connecting
-                      (let [new-edge {:from-node (:from-node connecting)
-                                      :from-port (:from-port connecting)
-                                      :to-node   (:node-id event)
-                                      :to-port   (:port-id event)}]
-                        (-> state
-                            (assoc :connecting nil)
-                            (update :edges conj new-edge)))
-                      state)))
+    (swap! *state
+           (fn [{:keys [connecting edges] :as state}]
+             (if connecting
+               (let [new-edge {:from-node (:from-node connecting)
+                               :from-port (:from-port connecting)
+                               :to-node   (:node-id event)
+                               :to-port   (:port-id event)}
+                     ;; Remove any existing edge connected to this specific input
+                     clean-edges (vec (remove #(and (= (:to-node %) (:node-id event))
+                                                    (= (:to-port %) (:port-id event)))
+                                              edges))]
+                 (-> state
+                     (assoc :connecting nil)
+                     (assoc :edges (conj clean-edges new-edge))
+                     (assoc :status "Wire connected!")))
+               state)))
 
     :cancel-connecting
-    (swap! *state assoc :connecting nil)
+    (swap! *state assoc :connecting nil :status "Wiring cancelled.")
+
+    :clear-wires
+    (swap! *state assoc :edges [] :connecting nil :status "Cleared all wires.")
 
     :run-graph
     (try
       (let [results (comp/run-graph @*state)]
-        (swap! *state update :nodes
-               (fn [nodes]
-                 (mapv (fn [n]
-                         (if (= (:type n) :output)
-                           (assoc n :result (get results (:id n) "nil"))
-                           n))
-                       nodes))))
+        (swap! *state (fn [s]
+                        (-> s
+                            (assoc :status "Executed successfully.")
+                            (update :nodes
+                                    (fn [nodes]
+                                      (mapv (fn [n]
+                                              (if (= (:type n) :output)
+                                                (assoc n :result (get results (:id n) "nil"))
+                                                n))
+                                            nodes)))))))
       (catch Exception ex
-        (println "[Execution Error]:" (.getMessage ex))))
+        (let [msg (.getMessage ex)]
+          (println "[Execution Error]:" msg)
+          (swap! *state assoc :status (str "Error: " msg)))))
 
     :start-drag
-    (let [fx-e (:fx/event event)]
-      (swap! *state assoc :drag-state {:node-id (:node-id event)
-                                       :start-x (.getSceneX fx-e)
-                                       :start-y (.getSceneY fx-e)}))
+    (let [fx-e (:fx/event event)
+          node-id (:node-id event)
+          node (first (filter #(= (:id %) node-id) (:nodes @*state)))]
+      (when node
+        (swap! *state assoc :drag-state {:node-id node-id
+                                         :mouse-x (.getSceneX fx-e)
+                                         :mouse-y (.getSceneY fx-e)
+                                         :node-x  (:x node)
+                                         :node-y  (:y node)})))
 
     :drag-node
-    (let [{:keys [node-id start-x start-y]} (:drag-state @*state)
-          fx-e (:fx/event event)]
-      (when node-id
-        (let [dx (- (.getSceneX fx-e) start-x)
-              dy (- (.getSceneY fx-e) start-y)]
-          (swap! *state (fn [s]
-                          (-> s
-                              (update :nodes (fn [nodes]
-                                               (mapv (fn [n]
-                                                       (if (= (:id n) node-id)
-                                                         (-> n
-                                                             (update :x + dx)
-                                                             (update :y + dy))
-                                                         n))
-                                                     nodes)))
-                              (assoc :drag-state {:node-id node-id
-                                                  :start-x (.getSceneX fx-e)
-                                                  :start-y (.getSceneY fx-e)})))))))
+    (let [fx-e (:fx/event event)
+          {:keys [node-id mouse-x mouse-y node-x node-y]} (:drag-state @*state)]
+      (when (and node-id mouse-x mouse-y)
+        (let [dx (- (.getSceneX fx-e) mouse-x)
+              dy (- (.getSceneY fx-e) mouse-y)]
+          (swap! *state update :nodes
+                 (fn [nodes]
+                   (mapv (fn [n]
+                           (if (= (:id n) node-id)
+                             (assoc n :x (+ node-x dx) :y (+ node-y dy))
+                             n))
+                         nodes))))))
 
     :stop-drag
-    (swap! *state assoc :drag-state nil)
+    (swap! *state dissoc :drag-state)
 
     nil))
 
@@ -127,11 +152,14 @@
       {:fx/type :cubic-curve
        :start-x x1 :start-y y1
        :end-x x2   :end-y y2
-       :control-x1 x1 :control-y1 (+ y1 45.0)
-       :control-x2 x2 :control-y2 (- y2 45.0)
-       :stroke "#4A90E2"
-       :stroke-width 2.5
-       :fill nil}
+       ;; Downward control points for classic Prograph flow
+       :control-x1 x1 :control-y1 (+ y1 50.0)
+       :control-x2 x2 :control-y2 (- y2 50.0)
+       :stroke "#61AFEF"
+       :stroke-width 3.0
+       :fill :transparent ;; can't be nil!!
+       ;; Critical: curves must be mouse-transparent so they don't block clicks beneath them
+       :mouse-transparent true}
       {:fx/type :group})))
 
 (defn render-node [{:keys [node connecting]}]
@@ -140,138 +168,186 @@
      :layout-x (:x node)
      :layout-y (:y node)
      :children
-     [;; Main Card Box
+     [;; 1. The Card Body (handles dragging)
       {:fx/type :v-box
        :pref-width node-width
        :pref-height node-height
+       :alignment :center
+       :spacing 4
        :on-mouse-pressed {:event/type :start-drag :node-id (:id node)}
        :on-mouse-dragged {:event/type :drag-node}
        :on-mouse-released {:event/type :stop-drag}
-       :style {:-fx-background-color "#2D3139"
-               :-fx-border-color (if is-output "#50E3C2" "#3E4451")
+       :style {:-fx-background-color "#282C34"
+               :-fx-border-color (if is-output "#98C379" "#4B5263")
                :-fx-border-width 2
-               :-fx-border-radius 6
-               :-fx-background-radius 6
-               :-fx-padding 8
-               :-fx-alignment "center"}}
+               :-fx-border-radius 8
+               :-fx-background-radius 8
+               :-fx-padding 6
+               :-fx-cursor "hand"}
+       :children
+       (case (:type node)
+         :val
+         [{:fx/type :label
+           :text "VALUE"
+           :mouse-transparent true
+           :style {:-fx-text-fill "#5C6370" :-fx-font-size 9 :-fx-font-weight "bold"}}
+          {:fx/type :text-field
+           :pref-width 85.0
+           :alignment :center
+           :text (str (:value node))
+           :style {:-fx-background-color "#1E1E24"
+                   :-fx-text-fill "#E5C07B"
+                   :-fx-font-size 13
+                   :-fx-font-weight "bold"}
+           :on-text-changed (fn [txt]
+                              (handle-event {:event/type :update-val
+                                             :node-id (:id node)
+                                             :val txt}))}]
 
-      ;; Content inside node
-      (case (:type node)
-        :val
-        {:fx/type :v-box
-         :layout-x 15.0 :layout-y 15.0
-         :children [{:fx/type :label :text "Value" :style {:-fx-text-fill "#ABB2BF" :-fx-font-size 10}}
-                    {:fx/type :text-field
-                     :pref-width 90.0
-                     :text (str (:value node))
-                     :on-text-changed (fn [txt]
-                                        (handle-event {:event/type :update-val
-                                                       :node-id (:id node)
-                                                       :val txt}))}]}
+         :fn
+         [{:fx/type :label
+           :text "FUNCTION"
+           :mouse-transparent true
+           :style {:-fx-text-fill "#5C6370" :-fx-font-size 9 :-fx-font-weight "bold"}}
+          {:fx/type :label
+           :text (str (:op node))
+           :mouse-transparent true
+           :style {:-fx-text-fill "#61AFEF"
+                   :-fx-font-size 22
+                   :-fx-font-weight "bold"}}]
 
-        :fn
-        {:fx/type :label
-         :layout-x 45.0 :layout-y 18.0
-         :text (str (:op node))
-         :style {:-fx-text-fill "#E5C07B"
-                 :-fx-font-size 22
-                 :-fx-font-weight "bold"}}
+         :output
+         [{:fx/type :label
+           :text "OUTPUT SINK"
+           :mouse-transparent true
+           :style {:-fx-text-fill "#98C379" :-fx-font-size 9 :-fx-font-weight "bold"}}
+          {:fx/type :label
+           :text (str (or (:result node) "---"))
+           :mouse-transparent true
+           :style {:-fx-text-fill "#FFFFFF"
+                   :-fx-font-size 18
+                   :-fx-font-weight "bold"}}])}
 
-        :output
-        {:fx/type :v-box
-         :layout-x 15.0 :layout-y 12.0
-         :children [{:fx/type :label :text "Output Sink" :style {:-fx-text-fill "#50E3C2" :-fx-font-size 10}}
-                    {:fx/type :label
-                     :text (str (or (:result node) "---"))
-                     :style {:-fx-text-fill "#FFFFFF"
-                             :-fx-font-size 16
-                             :-fx-font-weight "bold"}}]})
-
-      ;; Top Input Ports (Clickable)
+      ;; 2. Top Input Ports (Green)
       {:fx/type :group
        :children
        (map-indexed
         (fn [idx p]
-          (let [spacing (/ node-width (inc (count (:inputs node))))
-                px (* (inc idx) spacing)]
+          (let [px (port-x node idx (count (:inputs node)))]
             {:fx/type :circle
-             :center-x px :center-y 0.0 :radius 6.0
-             :fill (if connecting "#E06C75" "#98C379")
-             :stroke "#1E1E1E" :stroke-width 2
-             :on-mouse-clicked {:event/type :click-input-port :node-id (:id node) :port-id p}}))
+             :center-x (- px (:x node)) :center-y 0.0 :radius 7.5
+             :fill (if connecting "#98C379" "#4B5263")
+             :stroke "#1E1E24" :stroke-width 2
+             :style {:-fx-cursor "crosshair"}
+             ;; Consume mouse pressed so it doesn't drag the node
+             :on-mouse-pressed (fn [^javafx.scene.input.MouseEvent e] (.consume e))
+             :on-mouse-clicked (fn [^javafx.scene.input.MouseEvent e]
+                                 (.consume e)
+                                 (handle-event {:event/type :click-input-port
+                                                :node-id (:id node)
+                                                :port-id p}))}))
         (:inputs node))}
 
-      ;; Bottom Output Ports (Clickable)
+      ;; 3. Bottom Output Ports (Blue / Gold highlight when active)
       {:fx/type :group
        :children
        (map-indexed
         (fn [idx p]
-          (let [spacing (/ node-width (inc (count (:outputs node))))
-                px (* (inc idx) spacing)]
+          (let [px (port-x node idx (count (:outputs node)))
+                is-active (and connecting
+                               (= (:from-node connecting) (:id node))
+                               (= (:from-port connecting) p))]
             {:fx/type :circle
-             :center-x px :center-y node-height :radius 6.0
-             :fill "#61AFEF"
-             :stroke "#1E1E1E" :stroke-width 2
-             :on-mouse-clicked {:event/type :click-output-port :node-id (:id node) :port-id p}}))
+             :center-x (- px (:x node)) :center-y node-height :radius 7.5
+             :fill (if is-active "#E5C07B" "#61AFEF")
+             :stroke "#1E1E24" :stroke-width 2
+             :style {:-fx-cursor "crosshair"}
+             ;; Consume mouse pressed so it doesn't drag the node
+             :on-mouse-pressed (fn [^javafx.scene.input.MouseEvent e] (.consume e))
+             :on-mouse-clicked (fn [^javafx.scene.input.MouseEvent e]
+                                 (.consume e)
+                                 (handle-event {:event/type :click-output-port
+                                                :node-id (:id node)
+                                                :port-id p}))}))
         (:outputs node))}]}))
 
 ;; --- Top Level UI Shell ---
 
-(defn root-view [{:keys [nodes edges connecting]}]
+(defn root-view [{:keys [nodes edges connecting status]}]
   {:fx/type :stage
    :showing true
    :title "CloGraph - Visual Dataflow Editor"
-   :width 950
-   :height 600
+   :width 960
+   :height 620
    :scene
    {:fx/type :scene
     :root
     {:fx/type :border-pane
      :style {:-fx-background-color "#1E1E24"}
+
+     ;; Left Palette
      :left
      {:fx/type :v-box
-      :pref-width 180
-      :spacing 12
-      :style {:-fx-background-color "#25252D"
+      :pref-width 200
+      :spacing 10
+      :style {:-fx-background-color "#21252B"
               :-fx-padding 14
-              :-fx-border-color "#33333D"
+              :-fx-border-color "#333842"
               :-fx-border-width "0 1 0 0"}
       :children
-      [{:fx/type :label :text "PALETTE" :style {:-fx-text-fill "#5C6370" :-fx-font-weight "bold"}}
-       {:fx/type :button :text "+ Number Value" :pref-width 150
+      [{:fx/type :label :text "PALETTE" :style {:-fx-text-fill "#5C6370" :-fx-font-weight "bold" :-fx-font-size 11}}
+       {:fx/type :button :text "+ Number Value" :pref-width 170
         :on-action {:event/type :add-node :node-type :val}}
-       {:fx/type :button :text "+ Function (+)" :pref-width 150
+       {:fx/type :button :text "+ Function (+)" :pref-width 170
         :on-action {:event/type :add-node :node-type :fn}}
-       {:fx/type :button :text "+ Output Sink" :pref-width 150
+       {:fx/type :button :text "+ Output Sink" :pref-width 170
         :on-action {:event/type :add-node :node-type :output}}
-       {:fx/type :separator}
-       {:fx/type :label :text "ACTIONS" :style {:-fx-text-fill "#5C6370" :-fx-font-weight "bold"}}
+
+       {:fx/type :separator :style {:-fx-padding "8 0 8 0"}}
+
+       {:fx/type :label :text "ACTIONS" :style {:-fx-text-fill "#5C6370" :-fx-font-weight "bold" :-fx-font-size 11}}
        {:fx/type :button
         :text "▶ RUN GRAPH"
-        :pref-width 150
-        :style {:-fx-background-color "#98C379" :-fx-text-fill "#1E1E24" :-fx-font-weight "bold"}
-        :on-action {:event/type :run-graph}}]}
+        :pref-width 170
+        :style {:-fx-background-color "#98C379" :-fx-text-fill "#1E1E24" :-fx-font-weight "bold" :-fx-padding 8}
+        :on-action {:event/type :run-graph}}
+       {:fx/type :button
+        :text "Clear Wires"
+        :pref-width 170
+        :style {:-fx-background-color "#3E4451" :-fx-text-fill "#ABB2BF"}
+        :on-action {:event/type :clear-wires}}
 
+       {:fx/type :separator :style {:-fx-padding "8 0 8 0"}}
+
+       {:fx/type :label :text "STATUS" :style {:-fx-text-fill "#5C6370" :-fx-font-weight "bold" :-fx-font-size 11}}
+       {:fx/type :label
+        :text (or status "Ready.")
+        :wrap-text true
+        :pref-width 170
+        :style {:-fx-text-fill "#ABB2BF" :-fx-font-size 11}}]}
+
+     ;; Right Canvas
      :center
      {:fx/type :pane
       :on-mouse-clicked {:event/type :cancel-connecting}
       :children
       (concat
-       ;; 1. Render Wires (background)
+       ;; Layer 1: Wires (underneath)
        (map (fn [edge]
               (render-wire (assoc edge :nodes nodes)))
             edges)
-       ;; 2. Render Nodes (foreground)
+       ;; Layer 2: Nodes (on top)
        (map (fn [node]
               (render-node {:node node :connecting connecting}))
             nodes))}}}})
 
+;; Renderer configured with the map event handler enabled
 (def renderer
   (fx/create-renderer
    :middleware (fx/wrap-map-desc (fn [state] (root-view state)))
-   :opts {:fx.opt/type->lifecycle #(or (fx/keyword->lifecycle %)
-                                       (fx/fn->lifecycle %))}))
+   :opts {:fx.opt/map-event-handler handle-event}))
 
 (defn -main [& _args]
-  (fx/mount-renderer *state renderer)
-  (add-watch *state :event-watch (fn [_ _ _ _] (renderer))))
+  (fx/mount-renderer *state renderer))
+
+(-main)

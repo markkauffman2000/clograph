@@ -1,6 +1,10 @@
 (ns clograph.compiler)
 
-(ns clograph.compiler)
+(defn- node-sym
+  "Converts a keyword id like :val-1 into a Clojure symbol val-1."
+  [id]
+  (when id
+    (symbol (name id))))
 
 (defn- incoming-edge [edges to-node to-port]
   (first (filter #(and (= (:to-node %) to-node)
@@ -41,29 +45,33 @@
 
     :fn
     (let [arg-bindings (mapv (fn [p]
-                               (when-let [e (incoming-edge edges (:id node) p)]
-                                 (:from-node e)))
+                               (if-let [e (incoming-edge edges (:id node) p)]
+                                 (node-sym (:from-node e))
+                                 (throw (ex-info (str "Unconnected input port: " (name p) " on " (name (:id node)))
+                                                 {:node (:id node) :port p}))))
                              (:inputs node))]
       `(~(:op node) ~@arg-bindings))
 
     :output
-    (when-let [e (incoming-edge edges (:id node) (first (:inputs node)))]
-      (:from-node e))))
+    (if-let [e (incoming-edge edges (:id node) (first (:inputs node)))]
+      (node-sym (:from-node e))
+      nil)))
 
 (defn graph->clojure
-  "Compiles the DAG into a standard Clojure (let [...] result-map) AST."
+  "Compiles the DAG into a valid Clojure (let [sym expr ...] {...}) form."
   [{:keys [nodes edges]}]
   (let [sorted-nodes (topological-sort nodes edges)
         bindings (vec (mapcat (fn [n]
-                                [(:id n) (compile-node-expr n edges)])
+                                [(node-sym (:id n)) (compile-node-expr n edges)])
                               sorted-nodes))
         output-nodes (filter #(= :output (:type %)) nodes)
-        result-map (into {} (map (fn [o] [(:id o) (:id o)]) output-nodes))]
+        ;; Generates {:out-1 out-1} so keyword lookups work in the UI
+        result-map (into {} (map (fn [o] [(:id o) (node-sym (:id o))]) output-nodes))]
     `(let [~@bindings]
        ~result-map)))
 
 (defn run-graph
-  "Compiles and evaluates the graph in memory, returning a map of {node-id result}."
+  "Compiles and evaluates the graph in memory, returning {:out-1 42, ...}."
   [graph]
   (let [code (graph->clojure graph)]
     (println "\n[CloGraph Generated AST]:" (pr-str code))
