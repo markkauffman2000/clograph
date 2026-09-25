@@ -92,9 +92,19 @@
     :cancel-connecting
     (swap! *state assoc :connecting nil :status "Wiring cancelled.")
 
-    :clear-wires
-    (swap! *state assoc :edges [] :connecting nil :status "Cleared all wires.")
-
+   :clear-wires
+   (swap! *state (fn [s]
+                   (-> s
+                       (assoc :edges []
+                              :connecting nil
+                              :status "Cleared all wires and reset outputs.")
+                       (update :nodes
+                               (fn [nodes]
+                                 (mapv (fn [n]
+                                         (if (= (:type n) :output)
+                                           (assoc n :result nil)
+                                           n))
+                                       nodes))))))
     :run-graph
     (try
       (let [results (comp/run-graph @*state)]
