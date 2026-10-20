@@ -1,4 +1,5 @@
-(ns clograph.compiler)
+(ns clograph.compiler
+  (:require [clojure.string :as str]))
 
 (defn node-sym
   "Converts a keyword id like :val-1 into a Clojure symbol val-1."
@@ -28,6 +29,39 @@
             (recur rest-frontier visited)
             (recur (into rest-frontier (get adj curr #{}))
                    (conj visited curr))))))))
+
+(defn resolve-op
+  "Attempts to resolve a symbol or string to a loaded Clojure var."
+  [sym-or-str]
+  (let [s (if (string? sym-or-str) (str/trim sym-or-str) (str sym-or-str))]
+    (when (not-empty s)
+      (try
+        (let [sym (symbol s)]
+          (or (resolve sym)
+              (ns-resolve 'clojure.core sym)))
+        (catch Exception _ nil)))))
+
+(defn infer-arity
+  "Infers a sensible default input count from a Clojure var's arglists metadata."
+  [v]
+  (let [arglists (when (var? v) (:arglists (meta v)))]
+    (cond
+      (empty? arglists)
+      2
+
+      ;; Prefer binary (2 inputs) if supported (e.g. +, -, *, /, str, get)
+      (some (fn [args]
+              (= 2 (count (remove #{'&} args))))
+            arglists)
+      2
+
+      ;; Otherwise choose smallest non-zero arity (e.g. inc, dec, first -> 1; assoc -> 3)
+      :else
+      (let [non-zeros (->> arglists
+                           (map (fn [args] (count (remove #{'&} args))))
+                           (remove zero?)
+                           sort)]
+        (or (first non-zeros) 2)))))
 
 (defn- node-dependencies [nodes edges]
   (into {}
@@ -62,13 +96,16 @@
     (:value node)
 
     :fn
-    (let [arg-bindings (mapv (fn [p]
-                               (if-let [e (incoming-edge edges (:id node) p)]
-                                 (node-sym (:from-node e))
-                                 (throw (ex-info (str "Unconnected input port: " (name p) " on " (name (:id node)))
-                                                 {:node (:id node) :port p}))))
-                             (:inputs node))]
-      `(~(:op node) ~@arg-bindings))
+    (if-not (:op node)
+      (throw (ex-info (str "Function node " (name (:id node)) " has no operator defined!")
+                      {:node (:id node)}))
+      (let [arg-bindings (mapv (fn [p]
+                                 (if-let [e (incoming-edge edges (:id node) p)]
+                                   (node-sym (:from-node e))
+                                   (throw (ex-info (str "Unconnected input port: " (name p) " on " (name (:id node)))
+                                                   {:node (:id node) :port p}))))
+                               (:inputs node))]
+        `(~(:op node) ~@arg-bindings)))
 
     :output
     (if-let [e (incoming-edge edges (:id node) (first (:inputs node)))]

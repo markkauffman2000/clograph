@@ -1,6 +1,7 @@
 (ns clograph.core
   (:require [cljfx.api :as fx]
-            [clograph.compiler :as comp])
+            [clograph.compiler :as comp]
+            [clojure.string :as str])
   (:import [javafx.scene.control ContextMenu MenuItem]
            [javafx.scene.input MouseButton ContextMenuEvent MouseEvent])
   (:gen-class))
@@ -14,7 +15,7 @@
   {:nodes
    [{:id :val-1 :type :val    :value 15  :x 160.0 :y 50.0  :outputs [:out]}
     {:id :val-2 :type :val    :value 27  :x 380.0 :y 50.0  :outputs [:out]}
-    {:id :fn-1  :type :fn     :op '+     :x 270.0 :y 190.0 :inputs [:in-1 :in-2] :outputs [:out]}
+    {:id :fn-1  :type :fn     :op '+     :op-text "+" :editing? false :x 270.0 :y 190.0 :inputs [:in-1 :in-2] :outputs [:out]}
     {:id :out-1 :type :output :result nil :x 270.0 :y 340.0 :inputs [:in]}]
 
    :edges
@@ -24,7 +25,7 @@
 
    :connecting nil
    :drag-state nil
-   :status "Ready. Right-click nodes or ports for options."})
+   :status "Ready. Click function name to edit, or right-click for options."})
 
 (defonce *state (atom initial-state))
 
@@ -64,12 +65,76 @@
           id (keyword (str (name ntype) "-" (rand-int 1000)))
           new-node (case ntype
                      :val    {:id id :type :val :value 10 :x 100.0 :y 100.0 :outputs [:out]}
-                     :fn     {:id id :type :fn  :op '+    :x 100.0 :y 100.0 :inputs [:in-1 :in-2] :outputs [:out]}
+                     :fn     {:id id :type :fn  :op nil :op-text "" :editing? true :inputs [] :outputs [:out] :x 100.0 :y 100.0}
                      :output {:id id :type :output :result nil :x 100.0 :y 100.0 :inputs [:in]})]
       (swap! *state (fn [s]
                       (-> s
                           (update :nodes conj new-node)
-                          (assoc :status (str "Added " (name ntype) " node."))))))
+                          (assoc :status (if (= ntype :fn)
+                                           "Added Function node. Type operator and press Enter."
+                                           (str "Added " (name ntype) " node.")))))))
+
+    :edit-fn-node
+    (let [node-id (:node-id event)]
+      (swap! *state update :nodes
+             (fn [nodes]
+               (mapv (fn [n]
+                       (if (= (:id n) node-id)
+                         (assoc n :editing? true
+                                :op-text (if (:op n) (str (:op n)) ""))
+                         n))
+                     nodes))))
+
+    :update-fn-text
+    (let [{:keys [node-id text]} event]
+      (swap! *state update :nodes
+             (fn [nodes]
+               (mapv (fn [n]
+                       (if (= (:id n) node-id)
+                         (assoc n :op-text text)
+                         n))
+                     nodes))))
+
+    :commit-fn-op
+    (let [node-id (:node-id event)
+          node (first (filter #(= (:id %) node-id) (:nodes @*state)))
+          raw-text (or (:op-text node) "")
+          trimmed (str/trim raw-text)]
+      (if (empty? trimmed)
+        (if (:op node)
+          (swap! *state update :nodes
+                 (fn [nodes]
+                   (mapv #(if (= (:id %) node-id) (assoc % :editing? false) %) nodes)))
+          (swap! *state assoc :status "Please enter a function name (e.g. +, *, inc)."))
+        (let [sym (symbol trimmed)
+              resolved-var (comp/resolve-op sym)
+              arity (comp/infer-arity resolved-var)
+              new-inputs (mapv #(keyword (str "in-" (inc %))) (range arity))
+              new-input-set (set new-inputs)]
+          (swap! *state
+                 (fn [{:keys [nodes edges] :as state}]
+                   (let [downstream (comp/downstream-nodes edges node-id)
+                         clean-edges (vec (remove #(and (= (:to-node %) node-id)
+                                                        (not (new-input-set (:to-port %))))
+                                                  edges))]
+                     (-> state
+                         (assoc :edges clean-edges)
+                         (assoc :nodes
+                                (mapv (fn [n]
+                                        (cond
+                                          (= (:id n) node-id)
+                                          (assoc n :op sym
+                                                 :editing? false
+                                                 :inputs new-inputs)
+
+                                          (downstream (:id n))
+                                          (assoc n :result nil)
+
+                                          :else n))
+                                      nodes))
+                         (assoc :status (if resolved-var
+                                          (str "Configured '" sym "' (" arity " input ports).")
+                                          (str "Configured '" sym "' (defaulted to " arity " inputs)."))))))))))
 
     :delete-node
     (let [node-id (:node-id event)]
@@ -90,8 +155,10 @@
     (let [node-id (:node-id event)]
       (swap! *state
              (fn [{:keys [nodes edges] :as state}]
-               (let [downstream (comp/downstream-nodes edges node-id)
-                     new-port-id (keyword (str "in-" (inc (rand-int 9999))))]
+               (let [node (first (filter #(= (:id %) node-id) nodes))
+                     existing (set (:inputs node))
+                     new-port-id (first (remove existing (map #(keyword (str "in-" %)) (iterate inc 1))))
+                     downstream (comp/downstream-nodes edges node-id)]
                  (-> state
                      (assoc :nodes
                             (mapv (fn [n]
@@ -157,7 +224,7 @@
     :click-output-port
     (swap! *state assoc
            :connecting {:from-node (:node-id event) :from-port (:port-id event)}
-           :status (str "Wiring from " (name (:node-id event)) ". Click a green input port."))
+           :status (str "Wiring from " (name (:node-id event)) ". Click an input port."))
 
     :click-input-port
     (swap! *state
@@ -267,7 +334,7 @@
        :pref-width node-width
        :pref-height node-height
        :alignment :center
-       :spacing 4
+       :spacing 3
        :on-mouse-pressed {:event/type :start-drag :node-id (:id node)}
        :on-mouse-dragged {:event/type :drag-node}
        :on-mouse-released {:event/type :stop-drag}
@@ -276,7 +343,9 @@
          (.consume e)
          (let [items (cond-> []
                        (= :fn (:type node))
-                       (into [{:text "Add Input Port"
+                       (into [{:text "Edit Function Name"
+                               :on-action #(handle-event {:event/type :edit-fn-node :node-id (:id node)})}
+                              {:text "Add Input Port"
                                :on-action #(handle-event {:event/type :add-input-port :node-id (:id node)})}
                               (when (seq (:inputs node))
                                 {:text "Remove Last Input Port"
@@ -313,16 +382,51 @@
                                              :val txt}))}]
 
          :fn
-         [{:fx/type :label
-           :text "FUNCTION"
-           :mouse-transparent true
-           :style {:-fx-text-fill "#5C6370" :-fx-font-size 9 :-fx-font-weight "bold"}}
-          {:fx/type :label
-           :text (str (:op node))
-           :mouse-transparent true
-           :style {:-fx-text-fill "#61AFEF"
-                   :-fx-font-size 22
-                   :-fx-font-weight "bold"}}]
+         (if (:editing? node)
+           [{:fx/type :label
+             :text "SET FUNCTION"
+             :mouse-transparent true
+             :style {:-fx-text-fill "#E5C07B" :-fx-font-size 9 :-fx-font-weight "bold"}}
+            {:fx/type :h-box
+             :alignment :center
+             :spacing 4
+             :children
+             [{:fx/type :text-field
+               :pref-width 74.0
+               :prompt-text "+, *, inc"
+               :text (or (:op-text node) "")
+               :style {:-fx-background-color "#1E1E24"
+                       :-fx-text-fill "#61AFEF"
+                       :-fx-font-size 12
+                       :-fx-font-weight "bold"
+                       :-fx-alignment "center"}
+               :on-text-changed (fn [txt]
+                                  (handle-event {:event/type :update-fn-text
+                                                 :node-id (:id node)
+                                                 :text txt}))
+               :on-action {:event/type :commit-fn-op :node-id (:id node)}}
+              {:fx/type :button
+               :text "✓"
+               :style {:-fx-background-color "#98C379"
+                       :-fx-text-fill "#1E1E24"
+                       :-fx-font-weight "bold"
+                       :-fx-padding "2 6 2 6"
+                       :-fx-cursor "hand"}
+               :on-action {:event/type :commit-fn-op :node-id (:id node)}}]}]
+           [{:fx/type :label
+             :text "FUNCTION"
+             :mouse-transparent true
+             :style {:-fx-text-fill "#5C6370" :-fx-font-size 9 :-fx-font-weight "bold"}}
+            {:fx/type :label
+             :text (if (:op node) (str (:op node)) "?")
+             :style {:-fx-text-fill (if (:op node) "#61AFEF" "#E5C07B")
+                     :-fx-font-size 22
+                     :-fx-font-weight "bold"
+                     :-fx-cursor "hand"}
+             :on-mouse-clicked (fn [^MouseEvent e]
+                                 (.consume e)
+                                 (when (= (.getButton e) MouseButton/PRIMARY)
+                                   (handle-event {:event/type :edit-fn-node :node-id (:id node)})))}])
 
          :output
          [{:fx/type :label
@@ -412,7 +516,7 @@
       [{:fx/type :label :text "PALETTE" :style {:-fx-text-fill "#5C6370" :-fx-font-weight "bold" :-fx-font-size 11}}
        {:fx/type :button :text "+ Number Value" :pref-width 170
         :on-action {:event/type :add-node :node-type :val}}
-       {:fx/type :button :text "+ Function (+)" :pref-width 170
+       {:fx/type :button :text "+ Function Node" :pref-width 170
         :on-action {:event/type :add-node :node-type :fn}}
        {:fx/type :button :text "+ Output Sink" :pref-width 170
         :on-action {:event/type :add-node :node-type :output}}
