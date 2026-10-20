@@ -1,15 +1,33 @@
 (ns clograph.compiler)
 
-(defn- node-sym
+(defn node-sym
   "Converts a keyword id like :val-1 into a Clojure symbol val-1."
   [id]
   (when id
     (symbol (name id))))
 
-(defn- incoming-edge [edges to-node to-port]
+(defn incoming-edge [edges to-node to-port]
   (first (filter #(and (= (:to-node %) to-node)
                        (= (:to-port %) to-port))
                  edges)))
+
+(defn downstream-nodes
+  "Returns a set of all node IDs reachable downstream from `start-node-id`."
+  [edges start-node-id]
+  (let [adj (reduce (fn [acc {:keys [from-node to-node]}]
+                      (update acc from-node (fnil conj #{}) to-node))
+                    {}
+                    edges)]
+    (loop [frontier (get adj start-node-id #{})
+           visited  #{}]
+      (if (empty? frontier)
+        visited
+        (let [curr          (first frontier)
+              rest-frontier (disj frontier curr)]
+          (if (visited curr)
+            (recur rest-frontier visited)
+            (recur (into rest-frontier (get adj curr #{}))
+                   (conj visited curr))))))))
 
 (defn- node-dependencies [nodes edges]
   (into {}
@@ -65,7 +83,6 @@
                                 [(node-sym (:id n)) (compile-node-expr n edges)])
                               sorted-nodes))
         output-nodes (filter #(= :output (:type %)) nodes)
-        ;; Generates {:out-1 out-1} so keyword lookups work in the UI
         result-map (into {} (map (fn [o] [(:id o) (node-sym (:id o))]) output-nodes))]
     `(let [~@bindings]
        ~result-map)))

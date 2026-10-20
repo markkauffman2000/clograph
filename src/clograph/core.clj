@@ -1,32 +1,30 @@
 (ns clograph.core
   (:require [cljfx.api :as fx]
             [clograph.compiler :as comp])
+  (:import [javafx.scene.control ContextMenu MenuItem]
+           [javafx.scene.input MouseButton ContextMenuEvent MouseEvent])
   (:gen-class))
 
-;; --- State & Initial Top-to-Bottom Layout ---
+;; --- Geometry & Initial State ---
 
 (def node-width 140.0)
 (def node-height 75.0)
 
 (def initial-state
   {:nodes
-   [;; Top row: Input values
-    {:id :val-1 :type :val    :value 15  :x 160.0 :y 50.0  :outputs [:out]}
+   [{:id :val-1 :type :val    :value 15  :x 160.0 :y 50.0  :outputs [:out]}
     {:id :val-2 :type :val    :value 27  :x 380.0 :y 50.0  :outputs [:out]}
-    ;; Middle row: + Function
-    {:id :fn-1  :type :fn     :op '+     :x 270.0 :y 190.0 :inputs [:in-a :in-b] :outputs [:out]}
-    ;; Bottom row: Output Sink
+    {:id :fn-1  :type :fn     :op '+     :x 270.0 :y 190.0 :inputs [:in-1 :in-2] :outputs [:out]}
     {:id :out-1 :type :output :result nil :x 270.0 :y 340.0 :inputs [:in]}]
 
-   ;; Pre-wired edges: val-1 & val-2 -> fn-1 -> out-1
    :edges
-   [{:from-node :val-1 :from-port :out :to-node :fn-1 :to-port :in-a}
-    {:from-node :val-2 :from-port :out :to-node :fn-1 :to-port :in-b}
+   [{:from-node :val-1 :from-port :out :to-node :fn-1 :to-port :in-1}
+    {:from-node :val-2 :from-port :out :to-node :fn-1 :to-port :in-2}
     {:from-node :fn-1  :from-port :out :to-node :out-1 :to-port :in}]
 
-   :connecting nil   ;; {:from-node ... :from-port ...}
-   :drag-state nil   ;; {:node-id ... :mouse-x ... :mouse-y ... :node-x ... :node-y ...}
-   :status "Ready. Click RUN GRAPH or drag nodes."})
+   :connecting nil
+   :drag-state nil
+   :status "Ready. Right-click nodes or ports for options."})
 
 (defonce *state (atom initial-state))
 
@@ -44,6 +42,19 @@
           y (if (= kind :in) (:y node) (+ (:y node) node-height))]
       [x y])))
 
+;; --- Context Menu Helper ---
+
+(defn show-context-menu! [^ContextMenuEvent e items]
+  (let [cm (ContextMenu.)
+        menu-items (mapv (fn [{:keys [text on-action]}]
+                           (doto (MenuItem. text)
+                             (.setOnAction (reify javafx.event.EventHandler
+                                             (handle [_ _] (on-action))))))
+                         items)]
+    (.setAll (.getItems cm) (into-array MenuItem menu-items))
+    (.show cm ^javafx.scene.Node (.getSource e) (.getScreenX e) (.getScreenY e))
+    (.consume e)))
+
 ;; --- Central Event Handler ---
 
 (defn handle-event [{:keys [event/type] :as event}]
@@ -53,18 +64,95 @@
           id (keyword (str (name ntype) "-" (rand-int 1000)))
           new-node (case ntype
                      :val    {:id id :type :val :value 10 :x 100.0 :y 100.0 :outputs [:out]}
-                     :fn     {:id id :type :fn  :op '+    :x 100.0 :y 100.0 :inputs [:in-a :in-b] :outputs [:out]}
+                     :fn     {:id id :type :fn  :op '+    :x 100.0 :y 100.0 :inputs [:in-1 :in-2] :outputs [:out]}
                      :output {:id id :type :output :result nil :x 100.0 :y 100.0 :inputs [:in]})]
       (swap! *state (fn [s]
                       (-> s
                           (update :nodes conj new-node)
                           (assoc :status (str "Added " (name ntype) " node."))))))
 
+    :delete-node
+    (let [node-id (:node-id event)]
+      (swap! *state
+             (fn [{:keys [nodes edges] :as state}]
+               (let [downstream (comp/downstream-nodes edges node-id)
+                     remaining-nodes (vec (remove #(= (:id %) node-id) nodes))
+                     remaining-edges (vec (remove #(or (= (:from-node %) node-id)
+                                                       (= (:to-node %) node-id))
+                                                  edges))]
+                 (-> state
+                     (assoc :nodes (mapv #(if (downstream (:id %)) (assoc % :result nil) %) remaining-nodes))
+                     (assoc :edges remaining-edges)
+                     (assoc :connecting nil)
+                     (assoc :status (str "Deleted node " (name node-id))))))))
+
+    :add-input-port
+    (let [node-id (:node-id event)]
+      (swap! *state
+             (fn [{:keys [nodes edges] :as state}]
+               (let [downstream (comp/downstream-nodes edges node-id)
+                     new-port-id (keyword (str "in-" (inc (rand-int 9999))))]
+                 (-> state
+                     (assoc :nodes
+                            (mapv (fn [n]
+                                    (cond
+                                      (= (:id n) node-id)
+                                      (update n :inputs (fnil conj []) new-port-id)
+
+                                      (downstream (:id n))
+                                      (assoc n :result nil)
+
+                                      :else n))
+                                  nodes))
+                     (assoc :status (str "Added port " (name new-port-id) " to " (name node-id))))))))
+
+    :remove-input-port
+    (let [{:keys [node-id port-id]} event]
+      (swap! *state
+             (fn [{:keys [nodes edges] :as state}]
+               (let [downstream (comp/downstream-nodes edges node-id)
+                     clean-edges (vec (remove #(and (= (:to-node %) node-id)
+                                                    (= (:to-port %) port-id))
+                                              edges))]
+                 (-> state
+                     (assoc :edges clean-edges)
+                     (assoc :nodes
+                            (mapv (fn [n]
+                                    (cond
+                                      (= (:id n) node-id)
+                                      (update n :inputs (fn [ports] (vec (remove #(= % port-id) ports))))
+
+                                      (downstream (:id n))
+                                      (assoc n :result nil)
+
+                                      :else n))
+                                  nodes))
+                     (assoc :status (str "Removed port " (name port-id))))))))
+
+    :remove-last-input-port
+    (let [node-id (:node-id event)
+          node (first (filter #(= (:id %) node-id) (:nodes @*state)))
+          last-port (last (:inputs node))]
+      (when last-port
+        (handle-event {:event/type :remove-input-port :node-id node-id :port-id last-port})))
+
     :update-val
-    (let [val (or (try (Long/parseLong (:val event)) (catch Exception _ nil)) 0)]
-      (swap! *state update :nodes
-             (fn [nodes]
-               (mapv #(if (= (:id %) (:node-id event)) (assoc % :value val) %) nodes))))
+    (let [val     (or (try (Long/parseLong (:val event)) (catch Exception _ nil)) 0)
+          node-id (:node-id event)]
+      (swap! *state
+             (fn [{:keys [edges nodes] :as state}]
+               (let [affected (comp/downstream-nodes edges node-id)]
+                 (assoc state :nodes
+                        (mapv (fn [n]
+                                (cond
+                                  (= (:id n) node-id)
+                                  (assoc n :value val)
+
+                                  (and (affected (:id n)) (= (:type n) :output))
+                                  (assoc n :result nil)
+
+                                  :else n))
+                              nodes))))))
 
     :click-output-port
     (swap! *state assoc
@@ -73,38 +161,36 @@
 
     :click-input-port
     (swap! *state
-           (fn [{:keys [connecting edges] :as state}]
+           (fn [{:keys [connecting edges nodes] :as state}]
              (if connecting
-               (let [new-edge {:from-node (:from-node connecting)
+               (let [target-id (:node-id event)
+                     downstream (comp/downstream-nodes edges target-id)
+                     new-edge {:from-node (:from-node connecting)
                                :from-port (:from-port connecting)
-                               :to-node   (:node-id event)
+                               :to-node   target-id
                                :to-port   (:port-id event)}
-                     ;; Remove any existing edge connected to this specific input
-                     clean-edges (vec (remove #(and (= (:to-node %) (:node-id event))
+                     clean-edges (vec (remove #(and (= (:to-node %) target-id)
                                                     (= (:to-port %) (:port-id event)))
                                               edges))]
                  (-> state
                      (assoc :connecting nil)
                      (assoc :edges (conj clean-edges new-edge))
+                     (assoc :nodes (mapv #(if (downstream (:id %)) (assoc % :result nil) %) nodes))
                      (assoc :status "Wire connected!")))
                state)))
 
     :cancel-connecting
     (swap! *state assoc :connecting nil :status "Wiring cancelled.")
 
-   :clear-wires
-   (swap! *state (fn [s]
-                   (-> s
-                       (assoc :edges []
-                              :connecting nil
-                              :status "Cleared all wires and reset outputs.")
-                       (update :nodes
-                               (fn [nodes]
-                                 (mapv (fn [n]
-                                         (if (= (:type n) :output)
-                                           (assoc n :result nil)
-                                           n))
-                                       nodes))))))
+    :clear-wires
+    (swap! *state (fn [s]
+                    (-> s
+                        (assoc :edges []
+                               :connecting nil
+                               :status "Cleared all wires.")
+                        (update :nodes (fn [nodes]
+                                         (mapv #(if (= (:type %) :output) (assoc % :result nil) %) nodes))))))
+
     :run-graph
     (try
       (let [results (comp/run-graph @*state)]
@@ -127,7 +213,7 @@
     (let [fx-e (:fx/event event)
           node-id (:node-id event)
           node (first (filter #(= (:id %) node-id) (:nodes @*state)))]
-      (when node
+      (when (and node (= (.getButton fx-e) MouseButton/PRIMARY))
         (swap! *state assoc :drag-state {:node-id node-id
                                          :mouse-x (.getSceneX fx-e)
                                          :mouse-y (.getSceneY fx-e)
@@ -162,13 +248,11 @@
       {:fx/type :cubic-curve
        :start-x x1 :start-y y1
        :end-x x2   :end-y y2
-       ;; Downward control points for classic Prograph flow
        :control-x1 x1 :control-y1 (+ y1 50.0)
        :control-x2 x2 :control-y2 (- y2 50.0)
        :stroke "#61AFEF"
        :stroke-width 3.0
-       :fill :transparent ;; can't be nil!!
-       ;; Critical: curves must be mouse-transparent so they don't block clicks beneath them
+       :fill :transparent
        :mouse-transparent true}
       {:fx/type :group})))
 
@@ -178,7 +262,7 @@
      :layout-x (:x node)
      :layout-y (:y node)
      :children
-     [;; 1. The Card Body (handles dragging)
+     [;; 1. The Card Body
       {:fx/type :v-box
        :pref-width node-width
        :pref-height node-height
@@ -187,6 +271,20 @@
        :on-mouse-pressed {:event/type :start-drag :node-id (:id node)}
        :on-mouse-dragged {:event/type :drag-node}
        :on-mouse-released {:event/type :stop-drag}
+       :on-context-menu-requested
+       (fn [^ContextMenuEvent e]
+         (.consume e)
+         (let [items (cond-> []
+                       (= :fn (:type node))
+                       (into [{:text "Add Input Port"
+                               :on-action #(handle-event {:event/type :add-input-port :node-id (:id node)})}
+                              (when (seq (:inputs node))
+                                {:text "Remove Last Input Port"
+                                 :on-action #(handle-event {:event/type :remove-last-input-port :node-id (:id node)})})])
+                       :always
+                       (conj {:text "Delete Node"
+                              :on-action #(handle-event {:event/type :delete-node :node-id (:id node)})}))]
+           (show-context-menu! e (remove nil? items))))
        :style {:-fx-background-color "#282C34"
                :-fx-border-color (if is-output "#98C379" "#4B5263")
                :-fx-border-width 2
@@ -249,16 +347,23 @@
              :fill (if connecting "#98C379" "#4B5263")
              :stroke "#1E1E24" :stroke-width 2
              :style {:-fx-cursor "crosshair"}
-             ;; Consume mouse pressed so it doesn't drag the node
-             :on-mouse-pressed (fn [^javafx.scene.input.MouseEvent e] (.consume e))
-             :on-mouse-clicked (fn [^javafx.scene.input.MouseEvent e]
+             :on-mouse-pressed (fn [^MouseEvent e] (.consume e))
+             :on-mouse-clicked (fn [^MouseEvent e]
                                  (.consume e)
-                                 (handle-event {:event/type :click-input-port
-                                                :node-id (:id node)
-                                                :port-id p}))}))
+                                 (when (= (.getButton e) MouseButton/PRIMARY)
+                                   (handle-event {:event/type :click-input-port
+                                                  :node-id (:id node)
+                                                  :port-id p})))
+             :on-context-menu-requested
+             (fn [^ContextMenuEvent e]
+               (.consume e)
+               (show-context-menu! e [{:text "Delete Port"
+                                       :on-action #(handle-event {:event/type :remove-input-port
+                                                                  :node-id (:id node)
+                                                                  :port-id p})}]))}))
         (:inputs node))}
 
-      ;; 3. Bottom Output Ports (Blue / Gold highlight when active)
+      ;; 3. Bottom Output Ports (Blue / Gold highlight)
       {:fx/type :group
        :children
        (map-indexed
@@ -272,13 +377,13 @@
              :fill (if is-active "#E5C07B" "#61AFEF")
              :stroke "#1E1E24" :stroke-width 2
              :style {:-fx-cursor "crosshair"}
-             ;; Consume mouse pressed so it doesn't drag the node
-             :on-mouse-pressed (fn [^javafx.scene.input.MouseEvent e] (.consume e))
-             :on-mouse-clicked (fn [^javafx.scene.input.MouseEvent e]
+             :on-mouse-pressed (fn [^MouseEvent e] (.consume e))
+             :on-mouse-clicked (fn [^MouseEvent e]
                                  (.consume e)
-                                 (handle-event {:event/type :click-output-port
-                                                :node-id (:id node)
-                                                :port-id p}))}))
+                                 (when (= (.getButton e) MouseButton/PRIMARY)
+                                   (handle-event {:event/type :click-output-port
+                                                  :node-id (:id node)
+                                                  :port-id p})))}))
         (:outputs node))}]}))
 
 ;; --- Top Level UI Shell ---
@@ -295,7 +400,6 @@
     {:fx/type :border-pane
      :style {:-fx-background-color "#1E1E24"}
 
-     ;; Left Palette
      :left
      {:fx/type :v-box
       :pref-width 200
@@ -336,22 +440,18 @@
         :pref-width 170
         :style {:-fx-text-fill "#ABB2BF" :-fx-font-size 11}}]}
 
-     ;; Right Canvas
      :center
      {:fx/type :pane
       :on-mouse-clicked {:event/type :cancel-connecting}
       :children
       (concat
-       ;; Layer 1: Wires (underneath)
        (map (fn [edge]
               (render-wire (assoc edge :nodes nodes)))
             edges)
-       ;; Layer 2: Nodes (on top)
        (map (fn [node]
               (render-node {:node node :connecting connecting}))
             nodes))}}}})
 
-;; Renderer configured with the map event handler enabled
 (def renderer
   (fx/create-renderer
    :middleware (fx/wrap-map-desc (fn [state] (root-view state)))
